@@ -9,6 +9,7 @@
 #include "riscv.h"
 #include "defs.h"
 
+extern uint64 cas(volatile void *addr , int expected , int newval); 
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -30,31 +31,63 @@ kinit()
   freerange(end, (void*)PHYSTOP);
 }
 
-void
-freerange(void *pa_start, void *pa_end)
+int refcnt[PHYSTOP / PGSIZE];
+void freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  p = (char *)PGROUNDUP((uint64)pa_start);
+  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
+  {
+    refcnt[(uint64)p / PGSIZE] = 1;
     kfree(p);
+  }
 }
+void increse(uint64 pa)
+{ 
+  int pn = pa / PGSIZE;
+  if(pa>PHYSTOP || refcnt[pn]<1){
+    panic("increase ref cnt");
+  }
+  int old; 
+  do{
+    old = refcnt[pn];
+  }while(cas(&refcnt[pn] , old , old + 1));
+}
+
+void decraese(int pn)
+{ 
+  int old; 
+  do{
+    old = refcnt[pn];
+  }while(cas(&refcnt[pn] , old , old - 1));
+}
+
 
 // Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
-void
-kfree(void *pa)
+void kfree(void *pa)
 {
   struct run *r;
-
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  r = (struct run *)pa;
+  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+	//when we free the page decraese the refcnt of the pa 
+    //we need to acquire the lock
+    //and get the really current cnt for the current fucntion
+  acquire(&kmem.lock);
+  int pn = (uint64)r / PGSIZE;
+  if (refcnt[pn] < 1)
+    panic("kfree panic");
+  decraese(pn);
+  int tmp = refcnt[pn];
+  release(&kmem.lock);
 
+  if (tmp >0)
+    return;
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
 
   acquire(&kmem.lock);
   r->next = kmem.freelist;
@@ -72,11 +105,20 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+
+  if (r)
+  {
+    int pn = (uint64)r / PGSIZE;
+    if(refcnt[pn]!=0){
+      panic("refcnt kalloc");
+    }
+    refcnt[pn] = 1;
     kmem.freelist = r->next;
+  }
+
   release(&kmem.lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+  if (r)
+    memset((char *)r, 5, PGSIZE); // fill with junk
+  return (void *)r;
 }
